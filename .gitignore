@@ -1,0 +1,8 @@
+.env
+.env.local
+posted_urls.txt
+__pycache__/
+*.pyc
+*Anahtar*.txt
+api_keys.txt
+secrets.txt
