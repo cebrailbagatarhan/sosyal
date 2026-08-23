@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol
 
 import requests
 import schedule
@@ -14,26 +17,22 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from storage import ArticleStore, canonicalize_url
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
-POSTED_URLS_PATH = BASE_DIR / "posted_urls.txt"
-
+LEGACY_POSTED_URLS_PATH = BASE_DIR / "posted_urls.txt"
 NEWS_API_URL = "https://newsapi.org/v2/top-headlines"
 GROK_API_URL = "https://api.x.ai/v1/chat/completions"
-NEWS_SOURCES = "bbc-news,reuters"
-GROK_MODEL = "grok-beta"
-CHECK_INTERVAL_HOURS = 2
-REQUEST_TIMEOUT_SECONDS = 30
 MAX_TWEET_LENGTH = 280
 X_SHORT_URL_LENGTH = 23
 
 GROK_SYSTEM_PROMPT = (
-    "Sen profesyonel bir haber editörüsün. Sana verilen haberi X (Twitter) "
-    "platformu için en fazla 280 karakter olacak şekilde, dikkat çekici, "
-    "tarafsız bir Türkçe dille özetle ve 1-2 uygun hashtag ekle."
+    "Sen profesyonel bir haber editörüsün. Verilen haberi X için tarafsız bir "
+    "Türkçe dille özetle ve en fazla iki ilgili hashtag ekle. Doğrulanmamış "
+    "ayrıntı ekleme."
 )
-
 
 logger = logging.getLogger("x_news_bot")
 
@@ -49,64 +48,108 @@ class Article:
 class Config:
     news_api_key: str
     grok_api_key: str
-    x_api_key: str
-    x_api_secret: str
-    x_access_token: str
-    x_access_secret: str
-    news_sources: str = NEWS_SOURCES
-    grok_model: str = GROK_MODEL
+    grok_model: str
+    x_api_key: str = ""
+    x_api_secret: str = ""
+    x_access_token: str = ""
+    x_access_secret: str = ""
+    news_sources: str = "bbc-news,reuters"
+    check_interval_hours: int = 2
+    request_timeout_seconds: int = 30
+    grok_min_interval_seconds: float = 1.0
+    x_min_interval_seconds: float = 1.0
+    max_article_attempts: int = 5
+    database_path: Path = BASE_DIR / "data" / "news_bot.db"
 
     @classmethod
-    def from_env(cls) -> "Config":
-        if not ENV_PATH.exists():
-            raise FileNotFoundError(f".env dosyasi bulunamadi: {ENV_PATH}")
-
-        load_dotenv(ENV_PATH)
-
-        required_keys = [
-            "NEWS_API_KEY",
-            "GROK_API_KEY",
-            "X_API_KEY",
-            "X_API_SECRET",
-            "X_ACCESS_TOKEN",
-            "X_ACCESS_SECRET",
+    def from_env(cls, require_x: bool = True) -> "Config":
+        if ENV_PATH.exists():
+            load_dotenv(ENV_PATH)
+        required = ["NEWS_API_KEY", "GROK_API_KEY", "GROK_MODEL"]
+        if require_x:
+            required.extend(["X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"])
+        values = {key: os.getenv(key, "").strip() for key in required}
+        missing = [key for key, value in values.items() if not value]
+        if missing:
+            raise ValueError("Eksik ortam degiskenleri: " + ", ".join(sorted(missing)))
+        placeholders = [
+            key for key, value in values.items()
+            if value.casefold().startswith(("your_", "senin_")) or "buraya_yaz" in value.casefold()
         ]
-
-        values = {key: os.getenv(key, "").strip() for key in required_keys}
-        missing_keys = [key for key, value in values.items() if not value]
-        if missing_keys:
-            raise ValueError(
-                "Eksik ortam degiskenleri: " + ", ".join(sorted(missing_keys))
-            )
-
-        placeholder_keys = [
-            key
-            for key, value in values.items()
-            if value.lower().startswith("senin_") or "buraya_yaz" in value.lower()
-        ]
-        if placeholder_keys:
-            raise ValueError(
-                "Bu anahtarlar hala ornek deger icermekte: "
-                + ", ".join(sorted(placeholder_keys))
-            )
+        if placeholders:
+            raise ValueError("Ornek deger kalan degiskenler: " + ", ".join(sorted(placeholders)))
 
         return cls(
             news_api_key=values["NEWS_API_KEY"],
             grok_api_key=values["GROK_API_KEY"],
-            x_api_key=values["X_API_KEY"],
-            x_api_secret=values["X_API_SECRET"],
-            x_access_token=values["X_ACCESS_TOKEN"],
-            x_access_secret=values["X_ACCESS_SECRET"],
-            news_sources=os.getenv("NEWS_SOURCES", NEWS_SOURCES),
-            grok_model=os.getenv("GROK_MODEL", GROK_MODEL),
+            grok_model=values["GROK_MODEL"],
+            x_api_key=values.get("X_API_KEY", ""),
+            x_api_secret=values.get("X_API_SECRET", ""),
+            x_access_token=values.get("X_ACCESS_TOKEN", ""),
+            x_access_secret=values.get("X_ACCESS_SECRET", ""),
+            news_sources=os.getenv("NEWS_SOURCES", "bbc-news,reuters").strip(),
+            check_interval_hours=_positive_int("CHECK_INTERVAL_HOURS", 2),
+            request_timeout_seconds=_positive_int("REQUEST_TIMEOUT_SECONDS", 30),
+            grok_min_interval_seconds=_non_negative_float("GROK_MIN_INTERVAL_SECONDS", 1.0),
+            x_min_interval_seconds=_non_negative_float("X_MIN_INTERVAL_SECONDS", 1.0),
+            max_article_attempts=_positive_int("MAX_ARTICLE_ATTEMPTS", 5),
+            database_path=Path(os.getenv("BOT_DB_PATH", BASE_DIR / "data" / "news_bot.db")),
         )
 
 
+def _positive_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 1:
+        raise ValueError(f"{name} pozitif olmali")
+    return value
+
+
+def _non_negative_float(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} negatif olamaz")
+    return value
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for name in ("event", "article_url", "article_title", "tweet_id"):
+            value = getattr(record, name, None)
+            if value is not None:
+                payload[name] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+class RateGate:
+    def __init__(self, minimum_interval_seconds: float) -> None:
+        self.minimum_interval_seconds = minimum_interval_seconds
+        self._last_call = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            remaining = self.minimum_interval_seconds - (now - self._last_call)
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_call = time.monotonic()
 
 
 def build_retry_session() -> requests.Session:
@@ -114,248 +157,169 @@ def build_retry_session() -> requests.Session:
         total=3,
         connect=3,
         read=3,
+        status=3,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset({"GET", "POST"}),
+        respect_retry_after_header=True,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
-
     session = requests.Session()
     session.mount("https://", adapter)
-    session.mount("http://", adapter)
     return session
 
 
-class PostedURLStore:
-    def __init__(self, file_path: Path) -> None:
-        self.file_path = file_path
-
-    def load(self) -> set[str]:
-        if not self.file_path.exists():
-            return set()
-
-        with self.file_path.open("r", encoding="utf-8") as file:
-            return {line.strip() for line in file if line.strip()}
-
-    def add(self, url: str) -> None:
-        with self.file_path.open("a", encoding="utf-8") as file:
-            file.write(f"{url}\n")
-
-
 class NewsAPIClient:
-    def __init__(self, api_key: str, sources: str, session: requests.Session) -> None:
-        self.api_key = api_key
-        self.sources = sources
+    def __init__(self, config: Config, session: requests.Session) -> None:
+        self.config = config
         self.session = session
 
     def fetch_top_headlines(self) -> list[Article]:
-        params = {
-            "sources": self.sources,
-            "apiKey": self.api_key,
-            "pageSize": 10,
-        }
-
         try:
             response = self.session.get(
                 NEWS_API_URL,
-                params=params,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                params={"sources": self.config.news_sources, "apiKey": self.config.news_api_key, "pageSize": 10},
+                timeout=self.config.request_timeout_seconds,
             )
             response.raise_for_status()
             payload = response.json()
-        except requests.RequestException as exc:
-            raise RuntimeError("NewsAPI istegi basarisiz oldu.") from exc
-        except ValueError as exc:
-            raise RuntimeError("NewsAPI gecerli JSON donmedi.") from exc
-
+        except requests.RequestException as error:
+            raise RuntimeError("NewsAPI request failed") from error
+        except ValueError as error:
+            raise RuntimeError("NewsAPI returned invalid JSON") from error
         if payload.get("status") != "ok":
-            raise RuntimeError(
-                "NewsAPI hata dondu: "
-                f"{payload.get('code', 'unknown')} - {payload.get('message', 'Mesaj yok')}"
-            )
-
-        articles: list[Article] = []
+            raise RuntimeError(f"NewsAPI error: {payload.get('code', 'unknown')}")
+        articles = []
         for item in payload.get("articles", []):
-            title = (item.get("title") or "").strip()
-            description = (item.get("description") or "").strip()
-            url = (item.get("url") or "").strip()
-
-            if not title or not url:
-                continue
-
-            articles.append(
-                Article(
-                    title=title,
-                    description=description,
-                    url=url,
-                )
-            )
-
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if title and url:
+                articles.append(Article(title, str(item.get("description") or "").strip(), url))
         return articles
 
 
 class GrokClient:
-    def __init__(self, api_key: str, model: str, session: requests.Session) -> None:
-        self.api_key = api_key
-        self.model = model
+    def __init__(self, config: Config, session: requests.Session) -> None:
+        self.config = config
         self.session = session
+        self.rate_gate = RateGate(config.grok_min_interval_seconds)
 
     def summarize_article(self, article: Article) -> str:
+        self.rate_gate.wait()
         payload = {
-            "model": self.model,
+            "model": self.config.grok_model,
             "messages": [
                 {"role": "system", "content": GROK_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Baslik: {article.title}\n"
-                        f"Aciklama: {article.description or 'Aciklama bulunamadi.'}\n"
-                        f"Baglanti: {article.url}"
-                    ),
-                },
+                {"role": "user", "content": f"Baslik: {article.title}\nAciklama: {article.description or 'Yok'}"},
             ],
             "temperature": 0.4,
         }
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
         try:
             response = self.session.post(
                 GROK_API_URL,
-                headers=headers,
+                headers={"Authorization": f"Bearer {self.config.grok_api_key}", "Content-Type": "application/json"},
                 json=payload,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                timeout=self.config.request_timeout_seconds,
             )
             response.raise_for_status()
-            response_payload = response.json()
-        except requests.RequestException as exc:
-            raise RuntimeError("Grok API istegi basarisiz oldu.") from exc
-        except ValueError as exc:
-            raise RuntimeError("Grok API gecerli JSON donmedi.") from exc
-
-        try:
-            message = response_payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("Grok API yaniti beklenen formatta degil.") from exc
-
-        summary = self._extract_text(message).strip()
-        if not summary:
-            raise RuntimeError("Grok API bos bir ozet dondurdu.")
-
-        return collapse_whitespace(summary)
-
-    @staticmethod
-    def _extract_text(content: str | list[dict]) -> str:
-        if isinstance(content, str):
-            return content
-
+            content = response.json()["choices"][0]["message"]["content"]
+        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as error:
+            raise RuntimeError("Grok summarization failed") from error
         if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-            return " ".join(parts)
+            content = " ".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        summary = collapse_whitespace(str(content))
+        if not summary:
+            raise RuntimeError("Grok returned an empty summary")
+        return summary
 
-        return ""
+
+class Poster(Protocol):
+    def post_tweet(self, text: str) -> str: ...
 
 
 class XClient:
-    def __init__(
-        self,
-        consumer_key: str,
-        consumer_secret: str,
-        access_token: str,
-        access_secret: str,
-    ) -> None:
+    def __init__(self, config: Config) -> None:
+        self.rate_gate = RateGate(config.x_min_interval_seconds)
         self.client = tweepy.Client(
-            consumer_key=consumer_key,
-            consumer_secret=consumer_secret,
-            access_token=access_token,
-            access_token_secret=access_secret,
+            consumer_key=config.x_api_key,
+            consumer_secret=config.x_api_secret,
+            access_token=config.x_access_token,
+            access_token_secret=config.x_access_secret,
             wait_on_rate_limit=True,
         )
 
     def post_tweet(self, text: str) -> str:
+        self.rate_gate.wait()
         try:
             response = self.client.create_tweet(text=text, user_auth=True)
-        except tweepy.TweepyException as exc:
-            raise RuntimeError("X uzerine tweet gonderilemedi.") from exc
-
-        tweet_data = response.data or {}
-        tweet_id = str(tweet_data.get("id", "")).strip()
+        except tweepy.TweepyException as error:
+            raise RuntimeError("X post failed") from error
+        tweet_id = str((response.data or {}).get("id", "")).strip()
         if not tweet_id:
-            raise RuntimeError("X API tweet ID donmedi.")
-
+            raise RuntimeError("X API returned no tweet ID")
         return tweet_id
 
 
 class NewsBot:
-    def __init__(
-        self,
-        news_client: NewsAPIClient,
-        grok_client: GrokClient,
-        x_client: XClient,
-        url_store: PostedURLStore,
-    ) -> None:
+    def __init__(self, config: Config, news_client: NewsAPIClient, grok_client: GrokClient, store: ArticleStore, poster: Poster | None, dry_run: bool) -> None:
+        self.config = config
         self.news_client = news_client
         self.grok_client = grok_client
-        self.x_client = x_client
-        self.url_store = url_store
+        self.store = store
+        self.poster = poster
+        self.dry_run = dry_run
 
     def run_once(self) -> bool:
-        posted_urls = self.url_store.load()
-        logger.info("Kayitli %s URL bulundu.", len(posted_urls))
-
+        posted = self.store.posted_urls()
         articles = self.news_client.fetch_top_headlines()
-        logger.info("NewsAPI toplam %s haber dondurdu.", len(articles))
-
-        for article in self._iter_unposted_articles(articles, posted_urls):
+        logger.info("News cycle fetched articles", extra={"event": "articles_fetched"})
+        for article in articles:
             try:
-                logger.info("Yeni haber isleniyor: %s", article.title)
+                canonical_url = self.store.record_seen(article.url, article.title)
+            except ValueError:
+                logger.warning("Invalid article URL skipped", extra={"event": "invalid_url", "article_url": article.url})
+                continue
+            if canonical_url in posted or not self.store.can_attempt(canonical_url, self.config.max_article_attempts):
+                continue
+            try:
                 summary = self.grok_client.summarize_article(article)
                 tweet_text = build_tweet_text(summary, article.url)
-                tweet_id = self.x_client.post_tweet(tweet_text)
-                self.url_store.add(article.url)
-                logger.info("Tweet gonderildi. Tweet ID: %s", tweet_id)
+                if self.dry_run:
+                    self.store.mark_dry_run(canonical_url)
+                    logger.info(
+                        "Dry-run post preview: %s", tweet_text,
+                        extra={"event": "dry_run", "article_url": canonical_url, "article_title": article.title},
+                    )
+                else:
+                    if self.poster is None:
+                        raise RuntimeError("Poster is not configured")
+                    tweet_id = self.poster.post_tweet(tweet_text)
+                    self.store.mark_posted(canonical_url, tweet_id)
+                    logger.info("Post published", extra={"event": "posted", "article_url": canonical_url, "tweet_id": tweet_id})
                 return True
-            except Exception:
-                logger.exception("Haber islenirken hata olustu: %s", article.url)
-
-        logger.info("Paylasilacak yeni haber bulunamadi.")
+            except Exception as error:
+                self.store.mark_failed(canonical_url, f"{type(error).__name__}: {error}")
+                logger.exception("Article processing failed", extra={"event": "article_failed", "article_url": canonical_url})
+        logger.info("No publishable article", extra={"event": "no_article"})
         return False
 
     def run_forever(self) -> None:
-        logger.info(
-            "Bot baslatiliyor. Kontrol araligi: her %s saat.",
-            CHECK_INTERVAL_HOURS,
-        )
-        self._run_cycle()
-        schedule.every(CHECK_INTERVAL_HOURS).hours.do(self._run_cycle)
-
+        self._safe_cycle()
+        schedule.every(self.config.check_interval_hours).hours.do(self._safe_cycle)
         while True:
             schedule.run_pending()
             time.sleep(30)
 
-    def _run_cycle(self) -> None:
-        logger.info("Yeni kontrol dongusu basladi.")
+    def _safe_cycle(self) -> None:
         try:
             self.run_once()
         except Exception:
-            logger.exception("Kontrol dongusu genel hatayla sonlandi.")
-
-    @staticmethod
-    def _iter_unposted_articles(
-        articles: Iterable[Article], posted_urls: set[str]
-    ) -> Iterable[Article]:
-        for article in articles:
-            if article.url in posted_urls:
-                logger.info("Daha once paylasildigi icin atlandi: %s", article.url)
-                continue
-            yield article
+            logger.exception("News cycle failed", extra={"event": "cycle_failed"})
 
 
 def collapse_whitespace(text: str) -> str:
@@ -363,70 +327,64 @@ def collapse_whitespace(text: str) -> str:
 
 
 def truncate_text(text: str, limit: int) -> str:
-    clean_text = collapse_whitespace(text)
-    if limit <= 0:
-        return ""
-    if len(clean_text) <= limit:
-        return clean_text
+    clean = collapse_whitespace(text)
+    if len(clean) <= limit:
+        return clean
     if limit <= 3:
-        return clean_text[:limit]
-
-    return clean_text[: limit - 3].rstrip() + "..."
-
-
-def estimate_x_post_length(summary: str, url: str) -> int:
-    normalized_summary = collapse_whitespace(summary)
-    separator_length = 1 if normalized_summary and url else 0
-    url_length = X_SHORT_URL_LENGTH if url else 0
-    return len(normalized_summary) + separator_length + url_length
+        return clean[:limit]
+    return clean[: limit - 3].rstrip() + "..."
 
 
 def build_tweet_text(summary: str, url: str) -> str:
-    normalized_summary = collapse_whitespace(summary)
-
-    while estimate_x_post_length(normalized_summary, url) > MAX_TWEET_LENGTH:
-        summary_budget = MAX_TWEET_LENGTH - X_SHORT_URL_LENGTH - 1
-        normalized_summary = truncate_text(normalized_summary, summary_budget - 1)
-
-    return f"{normalized_summary} {url}".strip()
+    normalized = collapse_whitespace(summary)
+    summary_budget = MAX_TWEET_LENGTH - X_SHORT_URL_LENGTH - 1
+    if len(normalized) > summary_budget:
+        normalized = truncate_text(normalized, summary_budget)
+    return f"{normalized} {url}".strip()
 
 
-def build_bot(config: Config) -> NewsBot:
-    news_session = build_retry_session()
-    grok_session = build_retry_session()
-
-    news_client = NewsAPIClient(
-        api_key=config.news_api_key,
-        sources=config.news_sources,
-        session=news_session,
+def build_bot(config: Config, dry_run: bool) -> NewsBot:
+    session = build_retry_session()
+    store = ArticleStore(config.database_path)
+    migrated = store.migrate_legacy_file(LEGACY_POSTED_URLS_PATH)
+    if migrated:
+        logger.info("Legacy URLs migrated", extra={"event": "legacy_migration"})
+    return NewsBot(
+        config,
+        NewsAPIClient(config, session),
+        GrokClient(config, session),
+        store,
+        None if dry_run else XClient(config),
+        dry_run,
     )
-    grok_client = GrokClient(
-        api_key=config.grok_api_key,
-        model=config.grok_model,
-        session=grok_session,
-    )
-    x_client = XClient(
-        consumer_key=config.x_api_key,
-        consumer_secret=config.x_api_secret,
-        access_token=config.x_access_token,
-        access_secret=config.x_access_secret,
-    )
-    url_store = PostedURLStore(POSTED_URLS_PATH)
-    return NewsBot(news_client, grok_client, x_client, url_store)
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="NewsAPI → Grok → X pipeline")
+    parser.add_argument("--once", action="store_true", help="Run one polling cycle and exit")
+    parser.add_argument("--dry-run", action="store_true", help="Summarize and preview without posting")
+    return parser.parse_args()
+
+
+def main() -> int:
     configure_logging()
-
+    args = parse_args()
     try:
-        config = Config.from_env()
-        bot = build_bot(config)
-        bot.run_forever()
+        config = Config.from_env(require_x=not args.dry_run)
+        bot = build_bot(config, args.dry_run)
+        if args.once or args.dry_run:
+            bot.run_once()
+        else:
+            bot.run_forever()
+        return 0
     except KeyboardInterrupt:
-        logger.info("Bot kullanici tarafindan durduruldu.")
+        logger.info("Bot stopped by user", extra={"event": "stopped"})
+        return 130
     except Exception:
-        logger.exception("Bot baslatilamadi.")
+        logger.exception("Bot startup failed", extra={"event": "startup_failed"})
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+
