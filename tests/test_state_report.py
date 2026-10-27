@@ -18,6 +18,7 @@ class StateReportTests(unittest.TestCase):
             connection.executemany("INSERT INTO articles VALUES (?, ?, ?, ?)", [
                 ("seen", 0, "secret title", "https://example.org/secret"),
                 ("dry_run", 0, "secret title", "https://example.org/secret"),
+                ("dry_run", 5, "secret title", "https://example.org/secret"),
                 ("failed", 2, "secret title", "https://example.org/secret"),
                 ("failed", 5, "secret title", "https://example.org/secret"),
                 ("posted", 1, "secret title", "https://example.org/secret"),
@@ -25,8 +26,8 @@ class StateReportTests(unittest.TestCase):
 
     def test_counts_and_retry_limit(self):
         report = summarize_state(self.path)
-        self.assertEqual(report["total"], 5)
-        self.assertEqual(report["statuses"], {"seen": 1, "failed": 2, "dry_run": 1, "posted": 1})
+        self.assertEqual(report["total"], 6)
+        self.assertEqual(report["statuses"], {"seen": 1, "failed": 2, "dry_run": 2, "posted": 1})
         self.assertEqual(report["retry_exhausted"], 1)
         self.assertEqual(report["eligible_for_attempt"], 3)
         self.assertEqual(summarize_state(self.path, 2)["retry_exhausted"], 2)
