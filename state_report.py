@@ -27,7 +27,7 @@ def summarize_state(database: Path, max_attempts: int = 5) -> dict[str, object]:
             counts[status] += 1
             if status == "failed" and attempts >= max_attempts:
                 exhausted += 1
-            if status in ("seen", "dry_run") or (status == "failed" and attempts < max_attempts):
+            if status != "posted" and attempts < max_attempts:
                 pending += 1
     return {"total": sum(counts.values()), "statuses": counts,
             "retry_exhausted": exhausted, "eligible_for_attempt": pending}
