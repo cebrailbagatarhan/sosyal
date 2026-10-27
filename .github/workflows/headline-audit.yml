@@ -1,0 +1,28 @@
+name: Offline headline audit
+
+on:
+  pull_request:
+    paths:
+      - "headline_audit.py"
+      - "tests/test_headline_audit.py"
+      - ".github/workflows/headline-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile headline_audit.py tests/test_headline_audit.py
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -p 'test_headline_audit.py' -v
