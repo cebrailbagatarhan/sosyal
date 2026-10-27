@@ -74,6 +74,19 @@ Eski `posted_urls.txt` varsa açılışta idempotent biçimde `posted` kayıtlar
 | `MAX_ARTICLE_ATTEMPTS` | Hayır | `5` |
 | `BOT_DB_PATH` | Hayır | `data/news_bot.db` |
 
+## Çevrimdışı durum raporu
+
+Botun mevcut SQLite veritabanındaki durum sayılarını, yeniden denenebilir haberleri
+ve deneme sınırına ulaşan başarısız kayıtları **salt okunur** biçimde inceleyin:
+
+```bash
+python state_report.py --db data/news_bot.db --max-attempts 5 --json
+```
+
+Rapor yalnızca toplu sayılar içerir; haber başlıkları, URL'ler, hatalar ve
+API anahtarları yazdırılmaz. Veritabanı yoksa veya bozuksa araç hata kodu 2
+döndürür; yeni veritabanı oluşturmaz. Dış servislere istek yapmaz.
+
 ## Test
 
 Storage/dedup regresyon testleri harici API çağrısı yapmaz:
