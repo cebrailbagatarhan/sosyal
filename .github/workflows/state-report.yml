@@ -1,0 +1,28 @@
+name: Offline bot state report
+
+on:
+  pull_request:
+    paths:
+      - 'state_report.py'
+      - 'tests/test_state_report.py'
+      - '.github/workflows/state-report.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run read-only state report tests
+        run: python -m unittest discover -s tests -p 'test_state_report.py' -v
+      - name: Syntax check
+        run: python -m py_compile state_report.py tests/test_state_report.py
