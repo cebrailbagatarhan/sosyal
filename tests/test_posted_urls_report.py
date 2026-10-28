@@ -48,6 +48,31 @@ class PostedURLReportTests(unittest.TestCase):
                 self.assertEqual(main(["--file", str(Path(directory) / "missing.txt")]), 0)
             self.assertIn("Entries: 0", output.getvalue())
 
+    def test_strict_returns_failure_for_duplicate_or_invalid_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "urls.txt"
+            for urls in (
+                ("https://news.test/one", "https://news.test/one"),
+                ("https://news.test/one", "not-a-url"),
+            ):
+                path.write_text("\n".join(urls) + "\n", encoding="utf-8")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["--file", str(path), "--strict"]), 1)
+                    self.assertEqual(main(["--file", str(path)]), 0)
+
+    def test_strict_accepts_clean_or_missing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "urls.txt"
+            path.write_text("\n".join([
+                "https://news.test/one", "https://other.test/two"
+            ]) + "\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(main(["--file", str(path), "--strict", "--json"]), 0)
+            self.assertEqual(json.loads(output.getvalue())["invalid_entries"], 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--file", str(path.parent / "missing.txt"), "--strict"]), 0)
+
     def test_invalid_top_is_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:
