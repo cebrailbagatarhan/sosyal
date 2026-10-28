@@ -26,6 +26,18 @@ class HeadlineAuditTests(unittest.TestCase):
         self.assertEqual(result["distinct_sources"], 2)
         self.assertEqual(result["duplicate_urls"], 0)
 
+    def test_missing_descriptions_are_counted_without_rejecting_usable_articles(self):
+        report = audit_headlines({"status": "ok", "articles": [
+            {**article("First", "https://news.example/1"), "description": "Detailed summary"},
+            {**article("Second", "https://news.example/2"), "description": "  "},
+            article("Third", "https://news.example/3"),
+            None,
+        ]})
+        self.assertEqual(report["missing_descriptions"], 2)
+        self.assertEqual(report["usable"], 3)
+        self.assertEqual(report["invalid_entries"], 1)
+        self.assertNotIn("Detailed summary", str(report))
+
     def test_missing_titles_urls_and_invalid_entries(self):
         result = audit_headlines({"status": "ok", "articles": [
             article("", "https://news.example/a"),
