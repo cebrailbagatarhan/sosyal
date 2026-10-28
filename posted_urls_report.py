@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--file", type=Path, default=Path(__file__).resolve().parent / "posted_urls.txt")
     parser.add_argument("--top", type=int, default=10, help="Number of top domains (default: 10)")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    parser.add_argument("--strict", action="store_true", help="Exit 1 if duplicate or invalid URLs are found")
     args = parser.parse_args(argv)
     if args.top < 1:
         parser.error("--top must be at least 1")
@@ -60,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
               f"Duplicates: {result['duplicate_entries']} | Invalid: {result['invalid_entries']}")
         for item in result["domains"]:
             print(f"{item['domain']}: {item['posts']}")
-    return 0
+    return int(args.strict and bool(result["duplicate_entries"] or result["invalid_entries"]))
 
 
 if __name__ == "__main__":
