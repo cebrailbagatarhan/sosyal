@@ -82,6 +82,19 @@ Storage/dedup regresyon testleri harici API çağrısı yapmaz:
 python -m unittest discover -s tests -v
 ```
 
+## Çevrimdışı haber kalitesi raporu
+
+Kaydedilmiş NewsAPI JSON yanıtını API anahtarı kullanmadan veya paylaşım yapmadan denetleyin:
+
+```bash
+python headline_audit.py response.json --json
+```
+
+`missing_descriptions` alanı açıklaması eksik, boş veya yalnızca boşluk içeren
+makaleleri sayar. Başlık/URL geçerliyse makale hâlâ `usable` sayılır; `--strict`
+bu bilgilendirici metriği tek başına hata kabul etmez. Rapor başlıkları,
+açıklamaları veya URL'leri içermez.
+
 ## Sınırlamalar
 
 - Kaynak başlık/açıklaması hatalıysa özet de hatalı olabilir.
