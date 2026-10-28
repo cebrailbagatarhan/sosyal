@@ -40,6 +40,7 @@ def audit_headlines(payload: object) -> dict[str, int]:
         "articles": len(articles),
         "usable": 0,
         "missing_titles": 0,
+        "missing_descriptions": 0,
         "invalid_urls": 0,
         "duplicate_urls": 0,
         "invalid_entries": 0,
@@ -52,11 +53,14 @@ def audit_headlines(payload: object) -> dict[str, int]:
             report["invalid_entries"] += 1
             continue
         title = article.get("title")
+        description = article.get("description")
         url = article.get("url")
         title_ok = isinstance(title, str) and bool(title.strip())
         url_ok = _valid_url(url)
         if not title_ok:
             report["missing_titles"] += 1
+        if not isinstance(description, str) or not description.strip():
+            report["missing_descriptions"] += 1
         if not url_ok:
             report["invalid_urls"] += 1
         if url_ok:
