@@ -1,0 +1,29 @@
+name: Offline headline overlap tests
+
+on:
+  pull_request:
+    paths:
+      - "headline_compare.py"
+      - "headline_audit.py"
+      - "tests/test_headline_compare.py"
+      - ".github/workflows/headline-compare.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overlap-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile headline_compare.py tests/test_headline_compare.py
+      - name: Offline unit tests
+        run: python -m unittest discover -s tests -p 'test_headline_compare.py' -v
